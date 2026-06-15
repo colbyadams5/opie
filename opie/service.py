@@ -324,7 +324,7 @@ def _build_native_app(macos_dir):
         return (False, False)
     bin_path = os.path.join(macos_dir, "Opie")
     stamp_path = os.path.join(macos_dir, ".opie_build")
-    stamp = hashlib.sha256(("v1\x00" + swiftc + "\x00" + src).encode("utf-8")).hexdigest()
+    stamp = hashlib.sha256(("v2\x00" + swiftc + "\x00" + src).encode("utf-8")).hexdigest()
     if _is_macho(bin_path) and _read_text(stamp_path).strip() == stamp:
         return (True, False)  # already built from this exact source + toolchain
     build_dir = os.path.join(opie_config.app_support_dir(), "build")
@@ -335,8 +335,15 @@ def _build_native_app(macos_dir):
         with open(swift_file, "w", encoding="utf-8") as f:
             f.write(src)
         out_tmp = os.path.join(build_dir, f"Opie.{os.getpid()}.bin")
+        # Compile THROUGH xcrun, not the bare swiftc path: on macOS 26 invoking
+        # swiftc directly fails with "unable to load standard library for target
+        # …" because it can't locate the SDK without the SDKROOT/DEVELOPER_DIR
+        # that xcrun sets up. xcrun ships with the Command Line Tools, so it's
+        # present whenever swiftc is; fall back to the bare path if it somehow
+        # isn't (e.g. a hand-installed toolchain).
+        prefix = ["/usr/bin/xcrun", "swiftc"] if os.path.exists("/usr/bin/xcrun") else [swiftc]
         r = subprocess.run(
-            [swiftc, "-o", out_tmp, swift_file,
+            [*prefix, "-o", out_tmp, swift_file,
              "-framework", "Cocoa", "-framework", "WebKit"],
             capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
