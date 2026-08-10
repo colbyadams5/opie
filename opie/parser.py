@@ -304,6 +304,12 @@ def _first_int(tokens):
 # Level / action parsing                                                       #
 # --------------------------------------------------------------------------- #
 
+# Siri frequently mis-dictates "palette" as "pallet", "palate", "pallette", etc.
+# Match the common variants so a spoken palette recall still lands as a palette
+# instead of falling through and being read as an intensity level.
+_PAL = r"pal+[ae]t+e?s?"
+
+
 def _parse_level(level_tokens):
     """
     Interpret the part of a phrase after the selector.
@@ -319,16 +325,16 @@ def _parse_level(level_tokens):
     if not lv:
         return None
     # palettes: "color palette 2", "cp 2", "focus palette 3", "fp 3", etc.
-    m = re.search(r"\b(?:colou?r[ _]?palette|cp)\s*(\d+)", lv)
+    m = re.search(rf"\b(?:colou?r[ _]*(?:{_PAL})|cp)\s*(\d+)", lv)
     if m:
         return ("cp", int(m.group(1)))
-    m = re.search(r"\b(?:intensity[ _]?palette|ip)\s*(\d+)", lv)
+    m = re.search(rf"\b(?:intensity[ _]*(?:{_PAL})|ip)\s*(\d+)", lv)
     if m:
         return ("ip", int(m.group(1)))
-    m = re.search(r"\b(?:focus[ _]?palette|fp)\s*(\d+)", lv)
+    m = re.search(rf"\b(?:focus[ _]*(?:{_PAL})|fp)\s*(\d+)", lv)
     if m:
         return ("fp", int(m.group(1)))
-    m = re.search(r"\b(?:beam[ _]?palette|bp)\s*(\d+)", lv)
+    m = re.search(rf"\b(?:beam[ _]*(?:{_PAL})|bp)\s*(\d+)", lv)
     if m:
         return ("bp", int(m.group(1)))
     # moving-light parameter: "pan 50", "tilt -20", "zoom 75", "red 100" ...
@@ -587,7 +593,7 @@ def parse(phrase: str, config: dict) -> ParseResult:
     # 4c) bare palette recall onto the CURRENT selection (no target named):
     #     "color palette 2", "cp 2", "focus palette 3", "fp 3", ...
     m = re.fullmatch(
-        r"(?:(colou?r|intensity|focus|beam)[ _]?palette|(cp|ip|fp|bp))\s*(\d+)", text)
+        rf"(?:(colou?r|intensity|focus|beam)[ _]*(?:{_PAL})|(cp|ip|fp|bp))\s*(\d+)", text)
     if m:
         kindword = m.group(1) or m.group(2)
         num = m.group(3)
