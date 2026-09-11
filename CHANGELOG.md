@@ -49,6 +49,28 @@ All notable changes to Opie are documented here. This project uses
   degrades gracefully instead of raising.
 
 ### Fixed
+- **The control panel is responsive again — no more lag or delayed typing.** The panel
+  had grown steadily slower the longer it stayed open, to the point where keystrokes
+  arrived late. Three things caused it, all fixed:
+  - *Every status poll shelled out.* `/api/state` ran `lsof`, `launchctl list` and two
+    `git` calls and probed the relay over HTTP — on the request thread, on every poll,
+    for both the page (every 2.5s) and the Mac app (every 3s). Those probes now run on
+    a background sampler at the rate each fact can actually change, and the common
+    "is the relay up?" question is answered by a loopback connect that costs nothing.
+    A status request dropped from ~25ms to ~2ms on a fast Linux box, and `lsof` on a
+    Mac is considerably slower than that. Start/Stop still report the truth
+    immediately — changing something invalidates the sample it belongs to.
+  - *The log view grew without limit.* The live tail appended to the page forever; after
+    a show it held megabytes, and every new line re-laid-out the lot. In a browser
+    benchmark against a 3MB log, the old panel blocked the main thread for 12.5 of 12
+    seconds — i.e. permanently frozen — against 0ms now. The view keeps the most recent
+    ~160,000 characters, the poll is capped per request, and the log box is
+    layout-contained so it can't drag the rest of the page down with it.
+  - *Polls stacked up.* `setInterval` fired whether or not the previous request had come
+    back, so a slow answer left requests queueing behind each other. Polling now
+    schedules the next request only when the last one finishes, backs off while the
+    relay is quiet, slows to a heartbeat when the window is hidden, and only touches
+    the DOM for values that actually changed.
 - **Harmless client-disconnect tracebacks no longer look like crashes.** Siri and
   the panel's health poll routinely drop the socket the moment they have their reply;
   the stdlib HTTP server turned that into a `ConnectionResetError`/`BrokenPipeError`
