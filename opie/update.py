@@ -38,12 +38,20 @@ def repo_root(root=None):
     return root or opie_config.get_install_root()
 
 
+_HAVE_GIT = None
+
+
 def have_git() -> bool:
-    try:
-        return subprocess.run(["git", "--version"],
-                              capture_output=True, timeout=10).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    """Is git usable? Answered once per process: git doesn't appear or vanish
+    while Opie runs, and current_revision() is called on every status poll."""
+    global _HAVE_GIT
+    if _HAVE_GIT is None:
+        try:
+            _HAVE_GIT = subprocess.run(["git", "--version"],
+                                       capture_output=True, timeout=10).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _HAVE_GIT = False
+    return _HAVE_GIT
 
 
 def is_git_clone(root=None) -> bool:

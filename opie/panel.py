@@ -15,6 +15,7 @@ phone-facing endpoint still requires the token.
 """
 
 import argparse
+import copy
 import json
 import os
 import signal
@@ -37,6 +38,88 @@ from . import update as opie_update
 PANEL_HOST = "127.0.0.1"
 DEFAULT_PANEL_PORT = 8766
 POLICIES = ["block_all", "record_update", "allow_all"]
+
+# How long a sampled answer is served before it's refreshed in the background.
+# The panel is polled continuously (every 2.5s by the page, every 3s by the Mac
+# app), and every probe below costs a fork+exec or a network round trip — so
+# each one is sampled at the rate the underlying fact can actually change, not
+# once per request. Nothing expensive is ever on the request path.
+RUNNING_TTL = 2.5      # the deep "is the relay up" probe; the cheap one is live,
+                       # so this only actually runs while the relay looks down
+AUTOSTART_TTL = 15.0   # launchd agent: only changes when you toggle it here
+REVISION_TTL = 30.0    # git revisions: only change on an update or a restart
+SAMPLER_IDLE = 30.0    # stop sampling this long after the last read
+LOG_CHUNK_MAX = 256 * 1024   # bytes of log served per poll (the rest follows)
+
+
+class _Sampler:
+    """A value kept fresh in the background, read instantly.
+
+    A daemon thread re-samples every `ttl` seconds for as long as someone is
+    reading, so get() hands back the most recent sample without forking a
+    process or opening a socket. That keeps lsof, launchctl, git and network
+    timeouts off the request path entirely — the panel is polled several times
+    a second (the page and the Mac app both poll it), and those probes used to
+    run once per poll, per client, stacking up whenever one ran long.
+
+    The thread stops on its own once nothing has read for SAMPLER_IDLE, so a
+    panel nobody is looking at costs nothing.
+    """
+
+    def __init__(self, fn, ttl):
+        self._fn = fn
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._wake = threading.Event()    # "re-sample now"
+        self._ready = threading.Event()   # "there is a value to serve"
+        self._value = None
+        self._version = 0
+        self._thread = None
+        self._last_read = 0.0
+
+    def get(self, timeout=8.0):
+        with self._lock:
+            self._last_read = time.monotonic()
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, daemon=True)
+                self._thread.start()
+        # Only ever waits for the very first sample, or for a fresh one right
+        # after invalidate() — i.e. exactly when a stale answer would be wrong.
+        if not self._ready.is_set():
+            self._ready.wait(timeout)
+        return self._value
+
+    def invalidate(self):
+        """We just changed the thing being sampled: drop the old answer and take
+        a new one now, so nobody can be told about the world as it was."""
+        with self._lock:
+            self._version += 1
+        self._ready.clear()
+        self._wake.set()
+
+    def _loop(self):
+        while True:
+            self._wake.clear()
+            with self._lock:
+                version = self._version
+            try:
+                value = self._fn()
+            except Exception:  # noqa: BLE001 — a failed probe keeps the last answer
+                value = self._value
+            with self._lock:
+                # An invalidate() landed while we were sampling: this answer
+                # describes the old world, so don't publish it as the truth.
+                current = version == self._version
+                if current:
+                    self._value = value
+            if current:
+                self._ready.set()
+            if self._wake.wait(self._ttl):
+                continue                   # invalidate() asked for a fresh one
+            with self._lock:
+                if time.monotonic() - self._last_read > SAMPLER_IDLE:
+                    self._thread = None
+                    return
 
 # The revision THIS panel process loaded. After an update pulls new code onto
 # disk, the running process is stale — it must re-exec to actually apply it.
@@ -93,6 +176,12 @@ class Controller:
     def __init__(self, config_path):
         self.config_path = config_path
         opie_config.ensure_exists(config_path)
+        self._cfg_lock = threading.Lock()
+        self._cfg = None
+        self._cfg_key = None
+        self._running = _Sampler(self._probe_running, RUNNING_TTL)
+        self._autostart = _Sampler(service.is_loaded, AUTOSTART_TTL)
+        self._revisions = _Sampler(self._probe_revisions, REVISION_TTL)
 
     def _pidfile(self):
         return os.path.join(opie_config.app_support_dir(), "relay.pid")
@@ -102,7 +191,29 @@ class Controller:
 
     # ---- config ----
     def load(self):
-        return opie_config.load(self.config_path)
+        """The config, re-read only when the file on disk actually changed.
+
+        status() alone needs the config four or five times over, and the panel
+        is polled constantly — so this is a parse per change, not per read.
+        Callers get their own copy and can mutate it freely.
+        """
+        try:
+            st = os.stat(self.config_path)
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        with self._cfg_lock:
+            if key is not None and key == self._cfg_key:
+                return copy.deepcopy(self._cfg)
+        cfg = opie_config.load(self.config_path)
+        with self._cfg_lock:
+            self._cfg_key, self._cfg = key, copy.deepcopy(cfg)
+        return cfg
+
+    def invalidate_status(self):
+        """Forget the sampled status, so the next read reflects what we just did."""
+        for probe in (self._running, self._autostart, self._revisions):
+            probe.invalidate()
 
     def save(self, incoming):
         cfg = self.load()  # preserve unknown keys
@@ -271,6 +382,9 @@ class Controller:
             service.disable()
         else:
             raise ValueError(f"unknown action: {action}")
+        # We just changed the very things the samplers cache — don't serve the
+        # pre-action answer back to the page that asked for the change.
+        self.invalidate_status()
 
     # ---- status / info ----
     def _hosts(self, cfg=None):
@@ -296,6 +410,40 @@ class Controller:
                 continue
         return False
 
+    @staticmethod
+    def _port_live(port):
+        """Is something listening on the relay port, right now? Loopback only,
+        and therefore instant: the kernel either completes the connection or
+        refuses it without any network involved. This is the same ground truth
+        lsof gives us — someone holds the port — for a millionth of the cost,
+        which is why it can run on every request while the rest is sampled."""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+    # ---- sampled probes (see _Sampler: these run off the request path) ----
+    def _probe_running(self):
+        """The thorough answer, for when loopback says nothing is there: a relay
+        bound only to e.g. the Tailscale IP is still running as far as the phone
+        is concerned. lsof and the HTTP probes only ever run down here."""
+        port = self._port()
+        if self._port_live(port):
+            return True
+        for host in self._hosts()[1:]:          # loopback already answered
+            try:
+                with socket.create_connection((host, port), timeout=0.6):
+                    return True
+            except OSError:
+                continue
+        return bool(self._port_listeners(port)) or self._health(port)
+
+    def _probe_revisions(self):
+        """(revision on disk, revision the running relay loaded)."""
+        return (opie_update.current_revision() or "",
+                self.relay_info().get("revision", ""))
+
     def relay_info(self, port=None):
         """What the RUNNING relay reports about itself via /version — {} if it's
         unreachable or predates the endpoint. The code on disk may be newer than
@@ -312,19 +460,27 @@ class Controller:
         return {}
 
     def status(self):
+        """A snapshot for the UI. Everything expensive here is sampled in the
+        background (see _Sampler), so this returns without touching a
+        subprocess or the network — the page can poll it as often as it likes."""
         cfg = self.load()
         port = int(cfg.get("HTTP_PORT", 8765))
         bind = str(cfg.get("BIND_ADDR", "")).strip()
         host = bind if bind and bind != "0.0.0.0" else socket.gethostname()
+        revision, relay_revision = self._revisions.get() or ("", "")
+        # Live where it's free, sampled where it isn't: a relay on loopback
+        # shows up the instant it comes up, and only the awkward cases (bound
+        # elsewhere, or genuinely down) fall back to the background sample.
+        running = self._port_live(port) or bool(self._running.get())
         return {
             # Running = someone holds the relay port (what the phone sees),
             # not merely "an HTTP probe got through" — a relay bound only to
             # the Tailscale IP must never be reported as stopped.
-            "running": bool(self._port_listeners(port)) or self._health(port),
-            "autostart": service.is_loaded(),
+            "running": running,
+            "autostart": bool(self._autostart.get()),
             "version": __version__,
-            "revision": opie_update.current_revision() or "",
-            "relay_revision": self.relay_info(port).get("revision", ""),
+            "revision": revision,
+            "relay_revision": relay_revision,
             "port": port,
             "nomad_ip": cfg.get("NOMAD_IP", ""),
             "eos_port": cfg.get("EOS_RX_PORT", 8000),
@@ -368,7 +524,10 @@ class Controller:
                 pos = 0
             with open(path, "r", errors="replace") as f:
                 f.seek(pos)
-                data = f.read()
+                # Bounded: one runaway burst of relay output must not turn a
+                # routine poll into a multi-megabyte response. The tail that
+                # doesn't fit arrives on the next poll a moment later.
+                data = f.read(LOG_CHUNK_MAX)
                 return data, f.tell()
         except OSError:
             return "", pos
@@ -377,6 +536,9 @@ class Controller:
 def make_handler(ctrl):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Every response here is a small JSON blob on the loopback interface;
+        # without this, Nagle + delayed ACK can sit on one for tens of ms.
+        disable_nagle_algorithm = True
 
         def log_message(self, *a):
             pass  # quiet
@@ -474,6 +636,7 @@ def make_handler(ctrl):
                     self._json({"code": code, "body": body})
                 elif p.path == "/api/update":
                     status, msg = opie_update.check_and_update()
+                    ctrl.invalidate_status()  # the revisions just moved
                     if status == opie_update.UPDATED:
                         ctrl.control("restart")
                     elif status == opie_update.CURRENT:
@@ -710,10 +873,15 @@ code{font:12.5px var(--mono);background:var(--surface-2);border:1px solid var(--
 
 .logbar{display:flex;align-items:center;gap:9px;margin-bottom:12px}
 .live{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;color:var(--faint);margin-left:auto}
-.live .blip{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:blip 1.9s var(--ease) infinite}
-@keyframes blip{0%{box-shadow:0 0 0 0 oklch(0.78 0.16 150 / .5)}70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.live .blip{position:relative;width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.live .blip::after{content:"";position:absolute;inset:0;border-radius:50%;background:var(--ok);
+  animation:blip 1.9s var(--ease) infinite}
+@keyframes blip{0%{transform:scale(1);opacity:.5}70%{transform:scale(3);opacity:0}100%{opacity:0}}
+/* contain: the log grows to thousands of lines — without this, every appended
+   line re-runs layout for the whole page, which is what makes typing lag. */
 pre#log{margin:0;background:oklch(0.13 0.012 275);color:oklch(0.88 0.012 275);border:1px solid var(--line);
-  border-radius:12px;padding:14px;height:280px;overflow:auto;white-space:pre-wrap;font:12.5px/1.55 var(--mono)}
+  border-radius:12px;padding:14px;height:280px;overflow:auto;white-space:pre-wrap;font:12.5px/1.55 var(--mono);
+  contain:content}
 html[data-theme="light"] pre#log{background:oklch(0.23 0.015 275);color:oklch(0.93 0.01 275)}
 
 @media (max-width:560px){
@@ -845,8 +1013,8 @@ html[data-theme="light"] pre#log{background:oklch(0.23 0.015 275);color:oklch(0.
   <section class="panel">
     <div class="phead"><h2>Log</h2><p>Live tail of the relay, this run only.</p></div>
     <div class="logbar">
-      <button class="sm" id="pausebtn" onclick="paused=!paused;$('pausebtn').textContent=paused?'Resume':'Pause'">Pause</button>
-      <button class="sm" onclick="$('log').textContent=''">Clear</button>
+      <button class="sm" id="pausebtn" onclick="togglePause()">Pause</button>
+      <button class="sm" onclick="clearLog()">Clear</button>
       <span class="live"><span class="blip"></span> streaming</span>
     </div>
     <pre id="log"></pre>
@@ -858,6 +1026,12 @@ let logpos=0, paused=false, loaded=false;
 const $=id=>document.getElementById(id);
 const FIELDS=['NOMAD_IP','EOS_RX_PORT','HTTP_PORT','BIND_ADDR','LOG_FILE','TOKEN','OSC_USER'];
 const PANEL_DOWN='The Opie panel app is not running (the relay may be fine). Open the Opie app, then try again.';
+const STATE_MS=2500;          // how often status is refreshed while visible
+const LOG_MS=1000;            // log poll floor, backed off while nothing arrives
+const LOG_IDLE_MS=4000;       // ...up to this, so a quiet relay costs nothing
+const HIDDEN_MS=15000;        // background tab: stay current, stop hammering
+const LOG_KEEP=160000;        // characters of log kept in the DOM
+
 async function api(path,opts){ const r=await fetch(path,opts); return r.json(); }
 function esc(t){ return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function copy(t,btn){ navigator.clipboard.writeText(t).catch(()=>{});
@@ -865,37 +1039,39 @@ function copy(t,btn){ navigator.clipboard.writeText(t).catch(()=>{});
 function flash(el,cls,msg,keep){ el.className='feedback '+cls; el.textContent=msg;
   if(!keep) setTimeout(()=>{ el.textContent=''; },2600); }
 
+// Status is redrawn every couple of seconds. Writing a property that already
+// holds the same value still costs style, layout and paint work on the main
+// thread — which is the thread your keystrokes are waiting on — so every write
+// below is guarded by a comparison.
+function setText(el,v){ if(el.textContent!==v) el.textContent=v; }
+function setHTML(el,v){ if(el.innerHTML!==v) el.innerHTML=v; }
+function setStyle(el,k,v){ if(el.style[k]!==v) el.style[k]=v; }
+function setClass(el,v){ if(el.className!==v) el.className=v; }
+function setData(el,k,v){ if(el.dataset[k]!==v) el.dataset[k]=v; }
+
 function applyTheme(t){ document.documentElement.setAttribute('data-theme',t); try{localStorage.setItem('opie-theme',t);}catch(e){} }
 function toggleTheme(){ applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark'); }
 (function(){ let t='dark'; try{ t=localStorage.getItem('opie-theme')||'dark'; }catch(e){} document.documentElement.setAttribute('data-theme',t); })();
 
-async function refresh(){
-  let d;
-  try{ d=await api('/api/state'); }
-  catch(e){
-    $('hero').dataset.state='stopped';
-    $('status').textContent='Panel closed';
-    $('substatus').textContent='Open the Opie app to reconnect.';
-    return;
-  }
+function draw(d){
   const s=d.status;
-  $('hero').dataset.state = s.running?'running':'stopped';
-  $('status').textContent = s.running?'Running':'Stopped';
-  $('substatus').textContent = s.running?'Listening for phrases.':'Relay is not running. Press Start.';
+  setData($('hero'),'state', s.running?'running':'stopped');
+  setText($('status'), s.running?'Running':'Stopped');
+  setText($('substatus'), s.running?'Listening for phrases.':'Relay is not running. Press Start.');
   const ap=$('autopill');
-  if(s.autostart){ ap.style.display=''; ap.className='tag on'; ap.textContent='autostart on'; }
-  else { ap.style.display='none'; }
-  $('ver').textContent='Opie '+s.version+(s.revision?(' · '+s.revision):'');
-  $('url').innerHTML='Relay <b>http://localhost:'+s.port+'</b><span class="ar">&rarr;</span>OSC '
-    +esc(s.nomad_ip||'?')+':'+s.eos_port;
+  if(s.autostart){ setStyle(ap,'display',''); setClass(ap,'tag on'); setText(ap,'autostart on'); }
+  else { setStyle(ap,'display','none'); }
+  setText($('ver'),'Opie '+s.version+(s.revision?(' · '+s.revision):''));
+  setHTML($('url'),'Relay <b>http://localhost:'+s.port+'</b><span class="ar">&rarr;</span>OSC '
+    +esc(s.nomad_ip||'?')+':'+s.eos_port);
   const drift=$('drift');
   if(s.running && s.relay_revision && s.revision && s.relay_revision!==s.revision){
-    drift.style.display='block';
-    drift.textContent='Relay is still running '+s.relay_revision+', but '+s.revision
-      +' is installed. Click “Check for updates” to apply it.';
-  } else { drift.style.display='none'; }
-  $('purl').textContent=s.phone_url; $('ptok').textContent=s.token;
-  $('autostart').checked=s.autostart;
+    setStyle(drift,'display','block');
+    setText(drift,'Relay is still running '+s.relay_revision+', but '+s.revision
+      +' is installed. Click “Check for updates” to apply it.');
+  } else { setStyle(drift,'display','none'); }
+  setText($('purl'),s.phone_url); setText($('ptok'),s.token);
+  if($('autostart').checked!==s.autostart) $('autostart').checked=s.autostart;
   if(!loaded){ // fill the form once so we don't clobber edits
     const c=d.config;
     for(const k of FIELDS) $(k).value=c[k]??'';
@@ -906,6 +1082,25 @@ async function refresh(){
     $('key_map').value=JSON.stringify(c.key_map||{},null,2);
     loaded=true;
   }
+}
+
+// One /api/state request at a time. Timers used to fire regardless of whether
+// the previous request had come back, so a slow answer left requests stacking
+// up behind each other; a request asked for while one is in flight is folded
+// into a single follow-up instead.
+let stateBusy=false, stateAgain=false;
+async function refresh(){
+  if(stateBusy){ stateAgain=true; return; }
+  stateBusy=true;
+  try{
+    const d=await api('/api/state');
+    draw(d);
+  }catch(e){
+    setData($('hero'),'state','stopped');
+    setText($('status'),'Panel closed');
+    setText($('substatus'),'Open the Opie app to reconnect.');
+  }finally{ stateBusy=false; }
+  if(stateAgain){ stateAgain=false; await refresh(); }
 }
 async function save(restart){
   let macro,key;
@@ -961,12 +1156,57 @@ async function checkUpdate(){
   catch(e){ flash($('misc'),'err',PANEL_DOWN,true); return; }
   flash($('misc'),'muted',r.message,true); if(r.status==='updated') setTimeout(refresh,800);
 }
-async function pollLogs(){ if(paused) return;
-  try{ const r=await api('/api/logs?pos='+logpos);
-    if(r.text){ const el=$('log'); const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<40;
-      el.textContent+=r.text; if(atBottom) el.scrollTop=el.scrollHeight; } logpos=r.pos; }catch(e){} }
 
-refresh(); setInterval(refresh,2500); setInterval(pollLogs,1000);
+// The log is kept in a string and trimmed to the last LOG_KEEP characters. It
+// used to be appended to the <pre> forever: after a busy show the node held
+// megabytes, and every append re-laid-out all of it — the page got slower the
+// longer it stayed open, which is exactly the lag people hit.
+let logBuf='', logBusy=false;
+function clearLog(){ logBuf=''; $('log').textContent=''; }
+function togglePause(){ paused=!paused; $('pausebtn').textContent=paused?'Resume':'Pause';
+  if(!paused){ logWait=LOG_MS; pollLogs(); } }
+async function pollLogs(){
+  if(paused || logBusy) return false;
+  logBusy=true;
+  try{
+    const r=await api('/api/logs?pos='+logpos);
+    logpos=r.pos;
+    if(!r.text) return false;
+    const el=$('log');
+    // Read the scroll position BEFORE writing: interleaving reads and writes
+    // forces the browser to re-run layout mid-frame.
+    const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<40;
+    logBuf+=r.text;
+    if(logBuf.length>LOG_KEEP){
+      const cut=logBuf.indexOf('\\n', logBuf.length-LOG_KEEP);
+      logBuf=logBuf.slice(cut<0?logBuf.length-LOG_KEEP:cut+1);
+    }
+    el.textContent=logBuf;
+    if(atBottom) el.scrollTop=el.scrollHeight;
+    return true;
+  }catch(e){ return false; }
+  finally{ logBusy=false; }
+}
+
+// Self-scheduling loops rather than setInterval: the next poll is booked only
+// once the previous one has finished, and a hidden window drops to a slow
+// heartbeat instead of polling a panel nobody is looking at.
+let logWait=LOG_MS;
+async function stateLoop(){
+  try{ await refresh(); }catch(e){}
+  setTimeout(stateLoop, document.hidden?HIDDEN_MS:STATE_MS);
+}
+async function logLoop(){
+  let got=false;
+  try{ got=await pollLogs(); }catch(e){}
+  logWait = got ? LOG_MS : Math.min(Math.round(logWait*1.5), LOG_IDLE_MS);
+  setTimeout(logLoop, document.hidden?HIDDEN_MS:logWait);
+}
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden){ logWait=LOG_MS; refresh(); pollLogs(); }
+});
+
+stateLoop(); logLoop();
 </script>
 </body></html>"""
 
